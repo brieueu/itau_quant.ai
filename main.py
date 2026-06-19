@@ -4,7 +4,7 @@ Sistema avançado para previsão de matrizes de variância-covariância
 usando decomposição de Cholesky e redes neurais LSTM.
 """
 
-from gradio_interface import GradioInterface
+from interface.gradio_interface import GradioInterface
 
 
 def main():
@@ -19,7 +19,7 @@ def main():
     # Configurações de lançamento
     launch_config = {
         "server_name": "0.0.0.0",    # Acessível externamente
-        "server_port": 7862,         # Porta alternativa
+        "server_port": 7870,         # Porta alternativa
         "share": False,              # True para link público via gradio.live
         "debug": True,               # Modo debug para desenvolvimento
         "show_error": True,          # Mostrar erros detalhados

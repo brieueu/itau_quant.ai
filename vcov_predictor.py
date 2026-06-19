@@ -16,9 +16,8 @@ from scipy.linalg import cholesky
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from alpha_weighting import AlphaWeighting
-from gemini_insights import GeminiInsights
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -36,7 +35,6 @@ class VCovPredictor:
         """Inicialização do sistema."""
         self.scalers = {}  # Scalers para cada série temporal
         self.model = None
-        self.gemini_insights = GeminiInsights()  # Integração com Gemini AI
 
     def predict_vcov_matrix(self, tickers_input, period, window, progress_callback=None):
         """
@@ -101,7 +99,7 @@ class VCovPredictor:
             # Etapa 5: Preparação dos dados para LSTM
             if progress_callback:
                 progress_callback(steps[4])
-            X, y = self._prepare_lstm_data(time_series, sequence_length=30)
+            X, y = self._prepare_lstm_data(time_series, sequence_length=60)
 
             # Etapa 6: Treinamento do modelo LSTM
             if progress_callback:
@@ -111,7 +109,7 @@ class VCovPredictor:
             # Etapa 7: Previsão
             if progress_callback:
                 progress_callback(steps[6])
-            predicted_vcov = self._predict_next_vcov(time_series, len(tickers))
+            predicted_vcov = self._predict_next_vcov(time_series, len(tickers), steps_ahead=1)
 
             # Etapa 8: Finalizar
             if progress_callback:
@@ -233,70 +231,179 @@ class VCovPredictor:
 
         return time_series
 
-    def _prepare_lstm_data(self, time_series, sequence_length=30):
-        """Prepara dados no formato adequado para LSTM."""
+    def _prepare_lstm_data(self, time_series, sequence_length=60):
+        """
+        Prepara dados no formato adequado para LSTM com validação robusta.
+        
+        Args:
+            time_series: Série temporal dos elementos da matriz de Cholesky
+            sequence_length: Comprimento das sequências para o LSTM
+            
+        Returns:
+            X, y: Dados preparados para treinamento
+        """
         n_samples, n_features = time_series.shape
+        
+        print(f"📊 Preparando dados LSTM: {n_samples} amostras, {n_features} features")
+        
+        if n_samples < sequence_length + 50:  # Mínimo para treinar
+            raise ValueError(f"Dados insuficientes: {n_samples} < {sequence_length + 50} (mínimo)")
 
-        # Normalização das séries temporais
+        # Normalização robusta das séries temporais
         self.scalers = {}
         normalized_series = np.zeros_like(time_series)
 
         for i in range(n_features):
-            scaler = MinMaxScaler(feature_range=(-1, 1))
+            # Usar StandardScaler para melhor estabilidade
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
             normalized_series[:, i] = scaler.fit_transform(
                 time_series[:, i].reshape(-1, 1)
             ).flatten()
             self.scalers[i] = scaler
 
-        # Criação das sequências
+        # Criação das sequências com overlap
         X, y = [], []
+        step_size = 1  # Overlap total para mais dados de treino
 
-        for i in range(sequence_length, n_samples):
+        for i in range(sequence_length, n_samples, step_size):
             X.append(normalized_series[i - sequence_length:i])
             y.append(normalized_series[i])
 
-        return np.array(X), np.array(y)
+        X, y = np.array(X), np.array(y)
+        print(f"🔧 Sequências criadas: X{X.shape}, y{y.shape}")
+        
+        return X, y
 
     def _build_and_train_lstm(self, X, y, n_assets):
-        """Constrói e treina o modelo LSTM."""
+        """
+        Constrói e treina o modelo LSTM com arquitetura otimizada para V-Cov.
+        
+        Args:
+            X: Sequências de entrada
+            y: Targets de saída
+            n_assets: Número de ativos
+            
+        Returns:
+            model: Modelo LSTM treinado
+        """
         n_features = X.shape[2]
+        sequence_length = X.shape[1]
+        
+        print(f"🏗️ Construindo LSTM: entrada={X.shape}, saída={y.shape}")
 
-        # Arquitetura do modelo
+        # Arquitetura especializada para matrizes V-Cov
         model = keras.Sequential([
-            layers.LSTM(64, return_sequences=True, input_shape=(X.shape[1], n_features)),
+            # Primeira camada LSTM - captura padrões de longo prazo
+            layers.LSTM(
+                128, 
+                return_sequences=True, 
+                input_shape=(sequence_length, n_features),
+                dropout=0.1,
+                recurrent_dropout=0.1
+            ),
+            layers.BatchNormalization(),
+            
+            # Segunda camada LSTM - refina padrões
+            layers.LSTM(
+                64, 
+                return_sequences=True,
+                dropout=0.1,
+                recurrent_dropout=0.1
+            ),
+            layers.BatchNormalization(),
+            
+            # Terceira camada LSTM - extrai features finais
+            layers.LSTM(
+                32, 
+                return_sequences=False,
+                dropout=0.1,
+                recurrent_dropout=0.1
+            ),
+            
+            # Camadas densas para reconstrução
+            layers.Dense(64, activation='relu'),
             layers.Dropout(0.2),
-            layers.LSTM(32, return_sequences=False),
-            layers.Dropout(0.2),
-            layers.Dense(n_features, activation='tanh')
+            layers.Dense(32, activation='relu'),
+            layers.Dropout(0.1),
+            layers.Dense(n_features, activation='linear')  # Linear para valores contínuos
         ])
 
-        # Compilação
+        # Compilação com otimizador otimizado
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=0.001),
-            loss='mse',
-            metrics=['mae']
+            optimizer=keras.optimizers.Adam(
+                learning_rate=0.001,
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-8
+            ),
+            loss='huber',  # Huber loss é mais robusta para outliers
+            metrics=['mae', 'mse']
         )
 
-        # Treinamento
+        # Split temporal (último 20% para validação)
         split_idx = int(0.8 * len(X))
         X_train, X_val = X[:split_idx], X[split_idx:]
         y_train, y_val = y[:split_idx], y[split_idx:]
+        
+        print(f"📚 Treinamento: {len(X_train)} amostras, Validação: {len(X_val)} amostras")
 
-        model.fit(
+        # Callbacks para melhor treinamento
+        callbacks = [
+            keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=15,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.7,
+                patience=8,
+                min_lr=1e-6,
+                verbose=1
+            )
+        ]
+
+        # Treinamento
+        print("🚀 Iniciando treinamento LSTM...")
+        history = model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
-            epochs=50,
-            batch_size=32,
-            verbose=0
+            epochs=100,
+            batch_size=64,
+            callbacks=callbacks,
+            verbose=1,
+            shuffle=False  # Manter ordem temporal
         )
+        
+        # Avaliação final
+        train_loss = model.evaluate(X_train, y_train, verbose=0)[0]
+        val_loss = model.evaluate(X_val, y_val, verbose=0)[0]
+        print(f"✅ Treinamento concluído - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
 
         return model
 
-    def _predict_next_vcov(self, time_series, n_assets):
-        """Gera previsão da próxima matriz V-Cov."""
-        sequence_length = 30
+    def _predict_next_vcov(self, time_series, n_assets, steps_ahead=1):
+        """
+        Gera previsão da próxima matriz V-Cov garantindo positividade.
+        
+        Args:
+            time_series: Série temporal completa
+            n_assets: Número de ativos
+            steps_ahead: Número de períodos à frente para prever
+            
+        Returns:
+            vcov_pred_annual: Matriz V-Cov prevista anualizada
+        """
+        sequence_length = 60
+        
+        print(f"🔮 Gerando previsão para {steps_ahead} período(s) à frente...")
 
         # Preparar última sequência
+        if len(time_series) < sequence_length:
+            raise ValueError(f"Série muito curta: {len(time_series)} < {sequence_length}")
+            
         last_sequence = time_series[-sequence_length:]
 
         # Normalizar usando os scalers treinados
@@ -306,11 +413,19 @@ class VCovPredictor:
                 last_sequence[:, i].reshape(-1, 1)
             ).flatten()
 
-        # Fazer previsão
-        X_pred = normalized_sequence.reshape(1, sequence_length, -1)
-        y_pred_normalized = self.model.predict(X_pred, verbose=0)[0]
+        # Predição iterativa para múltiplos steps
+        current_sequence = normalized_sequence.copy()
+        
+        for step in range(steps_ahead):
+            # Fazer previsão
+            X_pred = current_sequence.reshape(1, sequence_length, -1)
+            y_pred_normalized = self.model.predict(X_pred, verbose=0)[0]
+            
+            # Atualizar sequência para próxima predição
+            if step < steps_ahead - 1:
+                current_sequence = np.vstack([current_sequence[1:], y_pred_normalized])
 
-        # Desnormalizar previsão
+        # Desnormalizar previsão final
         y_pred = np.zeros_like(y_pred_normalized)
         for i in range(len(y_pred_normalized)):
             y_pred[i] = self.scalers[i].inverse_transform(
@@ -318,20 +433,90 @@ class VCovPredictor:
             )[0, 0]
 
         # Reconstruir matriz de Cholesky
-        L_pred = np.zeros((n_assets, n_assets))
-        idx = 0
-        for i in range(n_assets):
-            for j in range(i + 1):
-                L_pred[i, j] = y_pred[idx]
-                idx += 1
+        L_pred = self._reconstruct_cholesky_matrix(y_pred, n_assets)
+        
+        # Garantir que a matriz de Cholesky seja válida
+        L_pred = self._ensure_valid_cholesky(L_pred)
 
         # Reconstruir matriz V-Cov
         vcov_pred = L_pred @ L_pred.T
+        
+        # Verificar se é positiva definida
+        vcov_pred = self._ensure_positive_definite(vcov_pred)
 
         # Anualizar (252 dias úteis)
         vcov_pred_annual = vcov_pred * 252
+        
+        print(f"✅ Matriz V-Cov prevista - Shape: {vcov_pred_annual.shape}")
+        print(f"📊 Determinante: {np.linalg.det(vcov_pred_annual):.2e}")
+        print(f"📈 Eigenvalores mín/máx: {np.min(np.linalg.eigvals(vcov_pred_annual)):.2e}/{np.max(np.linalg.eigvals(vcov_pred_annual)):.2e}")
 
         return vcov_pred_annual
+    
+    def _reconstruct_cholesky_matrix(self, elements, n_assets):
+        """Reconstrói matriz de Cholesky a partir dos elementos previstos."""
+        L = np.zeros((n_assets, n_assets))
+        idx = 0
+        
+        for i in range(n_assets):
+            for j in range(i + 1):
+                L[i, j] = elements[idx]
+                idx += 1
+                
+        return L
+    
+    def _ensure_valid_cholesky(self, L):
+        """Garante que a matriz de Cholesky seja válida."""
+        n = L.shape[0]
+        
+        # Garantir que elementos diagonais sejam positivos
+        for i in range(n):
+            if L[i, i] <= 0:
+                L[i, i] = max(abs(L[i, i]), 1e-6)
+        
+        # Zerar parte superior (garantir triangular inferior)
+        for i in range(n):
+            for j in range(i + 1, n):
+                L[i, j] = 0
+                
+        return L
+    
+    def _ensure_positive_definite(self, matrix, min_eigenvalue=1e-8):
+        """
+        Garante que a matriz seja positiva definida.
+        
+        Args:
+            matrix: Matriz a ser validada
+            min_eigenvalue: Valor mínimo para eigenvalues
+            
+        Returns:
+            matrix_pd: Matriz positiva definida
+        """
+        try:
+            # Verificar se já é positiva definida
+            eigvals = np.linalg.eigvals(matrix)
+            
+            if np.min(eigvals) > min_eigenvalue:
+                return matrix  # Já é positiva definida
+            
+            # Se não, usar decomposição espectral para corrigir
+            eigvals, eigvecs = np.linalg.eigh(matrix)
+            
+            # Corrigir eigenvalues negativos
+            eigvals = np.maximum(eigvals, min_eigenvalue)
+            
+            # Reconstruir matriz
+            matrix_pd = eigvecs @ np.diag(eigvals) @ eigvecs.T
+            
+            # Verificar simetria
+            matrix_pd = (matrix_pd + matrix_pd.T) / 2
+            
+            return matrix_pd
+            
+        except Exception as e:
+            print(f"⚠️ Erro na validação de matriz positiva definida: {e}")
+            # Fallback: adicionar regularização na diagonal
+            return matrix + np.eye(matrix.shape[0]) * min_eigenvalue
 
     def _generate_result_text(self, predicted_vcov, tickers):
         """Gera o texto formatado do resultado."""
@@ -486,63 +671,3 @@ class VCovPredictor:
         result_text += "- Ativos com alfa negativo podem ser candidatos a short\n\n"
         
         return result_text
-    
-    def configure_gemini(self, api_key: str) -> bool:
-        """
-        Configura a integração com Gemini AI.
-        
-        Args:
-            api_key: API key do Google AI Studio
-            
-        Returns:
-            bool: True se configuração bem-sucedida
-        """
-        return self.gemini_insights.set_api_key(api_key)
-    
-    def get_vcov_insights(self, vcov_matrix, tickers, additional_data=None) -> str:
-        """
-        Obtém insights sobre matriz V-Cov usando Gemini AI.
-        
-        Args:
-            vcov_matrix: Matriz de variância-covariância
-            tickers: Lista de tickers
-            additional_data: Dados adicionais para contexto
-            
-        Returns:
-            str: Insights do Gemini sobre a matriz V-Cov
-        """
-        return self.gemini_insights.analyze_vcov_matrix(vcov_matrix, tickers, additional_data)
-    
-    def get_alpha_insights(self, alpha_result: dict) -> str:
-        """
-        Obtém insights sobre ponderação alfa usando Gemini AI.
-        
-        Args:
-            alpha_result: Resultado do cálculo de ponderação alfa
-            
-        Returns:
-            str: Insights do Gemini sobre o portfólio alfa
-        """
-        return self.gemini_insights.analyze_alpha_portfolio(alpha_result)
-    
-    def get_market_commentary(self, tickers: list, context: str = "") -> str:
-        """
-        Gera comentário de mercado usando Gemini AI.
-        
-        Args:
-            tickers: Lista de tickers
-            context: Contexto adicional
-            
-        Returns:
-            str: Comentário de mercado do Gemini
-        """
-        return self.gemini_insights.generate_market_commentary(tickers, context)
-    
-    def list_gemini_models(self) -> str:
-        """
-        Lista modelos disponíveis do Gemini AI.
-        
-        Returns:
-            str: Lista de modelos disponíveis
-        """
-        return self.gemini_insights.list_available_models()
