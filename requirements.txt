@@ -1,8 +1,8 @@
-gradio>=5.0.0
-tensorflow>=2.20.0
-numpy<2.0.0
-pandas>=2.0.0
-yfinance>=0.2.0
-scikit-learn>=1.5.0
-scipy>=1.10.0
-plotly>=6.0.0
+gradio>=6.22.0,<7.0.0
+tensorflow>=2.21.0,<3.0.0
+numpy>=2.5.2,<3.0.0
+pandas>=3.0.5,<4.0.0
+yfinance>=1.5.2,<2.0.0
+scikit-learn>=1.9.0,<2.0.0
+scipy>=1.18.0,<2.0.0
+plotly>=6.9.0,<7.0.0

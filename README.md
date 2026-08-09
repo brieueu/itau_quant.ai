@@ -89,12 +89,12 @@ O backtest simula rebalanceamentos periódicos e calcula métricas como retorno 
 
 ## Como executar
 
-Crie um ambiente virtual e instale as dependências:
+Use Python 3.12 ou 3.13, crie um ambiente virtual e instale as dependências travadas:
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.lock
 ```
 
 Execute a aplicação:
